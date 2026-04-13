@@ -1,0 +1,24 @@
+{
+  "name": "cli-maker",
+  "version": "0.1.0",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "cli-maker": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "dev": "bun --watch src/index.ts",
+    "build": "bun build --compile src/index.ts --outfile cli-maker",
+    "typecheck": "bunx tsc --noEmit",
+    "lint": "bunx biome check src/",
+    "check": "bun run lint && bun run typecheck"
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.12"
+  }
+}
