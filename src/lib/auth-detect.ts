@@ -193,6 +193,51 @@ function detectSaml(exchanges: CapturedExchange[]): AuthProfile | null {
 
 // ─── Detector: OAuth2/OIDC ──────────────────────────────────────
 
+// Known OIDC provider URL patterns
+const OIDC_PROVIDER_PATTERNS = [
+	// Keycloak
+	/\/auth\/realms\/[^/]+\/protocol\/openid-connect/,
+	/\/realms\/[^/]+\/protocol\/openid-connect/,
+	// Microsoft Entra / Azure AD
+	/login\.microsoftonline\.com/,
+	/login\.microsoft\.com/,
+	/sts\.windows\.net/,
+	// Auth0
+	/\.auth0\.com\/authorize/,
+	// Okta
+	/\.okta\.com\/oauth2/,
+	/\.oktapreview\.com\/oauth2/,
+	// Google
+	/accounts\.google\.com\/o\/oauth2/,
+	// Generic
+	/\/\.well-known\/openid-configuration/,
+];
+
+function extractOAuth2Params(urlStr: string): {
+	authorizeEndpoint: string;
+	clientId: string | null;
+	responseType: string | null;
+	redirectUri: string | null;
+	scopes: string[];
+} | null {
+	try {
+		const parsed = new URL(urlStr);
+		const params = parsed.searchParams;
+		if (params.has("client_id") && params.has("response_type")) {
+			return {
+				authorizeEndpoint: `${parsed.origin}${parsed.pathname}`,
+				clientId: params.get("client_id"),
+				responseType: params.get("response_type"),
+				redirectUri: params.get("redirect_uri"),
+				scopes: params.get("scope")?.split(/[+ ]/) ?? [],
+			};
+		}
+	} catch {
+		// invalid URL
+	}
+	return null;
+}
+
 function detectOAuth2(exchanges: CapturedExchange[]): AuthProfile | null {
 	let authorizeEndpoint: string | null = null;
 	let tokenEndpoint: string | null = null;
@@ -200,45 +245,71 @@ function detectOAuth2(exchanges: CapturedExchange[]): AuthProfile | null {
 	let responseType: string | null = null;
 	let redirectUri: string | null = null;
 	const scopes: string[] = [];
+	const providerHints: string[] = [];
 
 	for (const ex of exchanges) {
 		const url = ex.request.url;
-		try {
-			const parsed = new URL(url);
-			const params = parsed.searchParams;
 
-			// Detect authorize endpoint
-			if (params.has("client_id") && params.has("response_type")) {
-				authorizeEndpoint = `${parsed.origin}${parsed.pathname}`;
-				clientId = params.get("client_id");
-				responseType = params.get("response_type");
-				redirectUri = params.get("redirect_uri");
-				const scope = params.get("scope");
-				if (scope) scopes.push(...scope.split(" "));
+		// Check request URLs for OAuth2 params
+		const fromUrl = extractOAuth2Params(url);
+		if (fromUrl) {
+			authorizeEndpoint = fromUrl.authorizeEndpoint;
+			clientId = fromUrl.clientId;
+			responseType = fromUrl.responseType;
+			redirectUri = fromUrl.redirectUri;
+			scopes.push(...fromUrl.scopes);
+		}
+
+		// Check redirect Location headers for OAuth2 params (critical for SSO flows)
+		const location = ex.response?.headers["location"];
+		if (location) {
+			const fromLocation = extractOAuth2Params(location);
+			if (fromLocation) {
+				authorizeEndpoint = fromLocation.authorizeEndpoint;
+				clientId = fromLocation.clientId;
+				responseType = fromLocation.responseType;
+				redirectUri = fromLocation.redirectUri;
+				scopes.push(...fromLocation.scopes);
 			}
+		}
 
-			// Detect token endpoint
+		// Check for known OIDC provider patterns in URLs and redirects
+		const urlsToCheck = [url, location].filter((u): u is string => u != null);
+		for (const u of urlsToCheck) {
+			for (const pattern of OIDC_PROVIDER_PATTERNS) {
+				if (pattern.test(u)) {
+					providerHints.push(u);
+				}
+			}
+		}
+
+		// Detect token endpoint
+		try {
 			const postData = ex.request.postData ?? "";
 			if (postData.includes("grant_type=") && ex.request.method === "POST") {
+				const parsed = new URL(url);
 				tokenEndpoint = `${parsed.origin}${parsed.pathname}`;
 			}
 		} catch {
-			continue;
+			// invalid URL
 		}
 	}
 
-	if (!authorizeEndpoint && !tokenEndpoint) return null;
+	if (!authorizeEndpoint && !tokenEndpoint && providerHints.length === 0) return null;
 
-	let confidence = 50;
-	if (authorizeEndpoint && tokenEndpoint) confidence = 90;
-	else if (authorizeEndpoint && clientId) confidence = 70;
+	let confidence = 40;
+	if (authorizeEndpoint && tokenEndpoint) confidence = 95;
+	else if (authorizeEndpoint && clientId) confidence = 85;
+	else if (providerHints.length > 0 && (authorizeEndpoint || clientId)) confidence = 80;
+	else if (providerHints.length >= 2) confidence = 75;
+	else if (providerHints.length === 1) confidence = 60;
 
 	return {
 		mechanism: "oauth2-oidc",
 		confidence,
 		details: {
 			mechanism: "oauth2-oidc",
-			loginUrl: authorizeEndpoint,
+			loginUrl: authorizeEndpoint ?? providerHints[0] ?? null,
 			tokenEndpoint: tokenEndpoint ?? "unknown",
 			authorizeEndpoint: authorizeEndpoint ?? "unknown",
 			clientId,

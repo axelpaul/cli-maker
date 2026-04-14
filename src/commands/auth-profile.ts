@@ -18,10 +18,11 @@ export async function authProfile(opts: AuthProfileOptions): Promise<void> {
 	log(`Opening browser at ${opts.url}...`);
 	const session = await launchBrowser({ headless: opts.headless });
 
-	// Capture bodies by default for auth profiling (needed for JWT detection)
+	// Capture bodies and include all resource types — auth flows rely on
+	// document redirects (302 chains through IdPs) and script loads
 	const interceptor = attachInterceptor(session.page, {
 		captureBodies: true,
-		noiseFilter: {},
+		noiseFilter: { includeStaticAssets: true },
 	});
 
 	try {
