@@ -502,23 +502,106 @@ function detectBasicAuth(exchanges: CapturedExchange[]): AuthProfile | null {
 	return null;
 }
 
+// ─── Detector: SMS / OTP ────────────────────────────────────────
+
+const OTP_FIELD_NAMES = new Set([
+	"code", "otp", "token", "pin", "verification_code", "verificationcode",
+	"sms_code", "smscode", "one_time_code", "otpcode",
+]);
+
+const PHONE_FIELD_NAMES = new Set([
+	"phone", "phone_number", "phonenumber", "mobile", "tel", "telephone",
+	"msisdn", "sms", "cellphone",
+]);
+
+function detectSmsOtp(exchanges: CapturedExchange[]): AuthProfile | null {
+	let phoneEndpoint: string | null = null;
+	let verifyEndpoint: string | null = null;
+	let phoneFields: string[] = [];
+	let codeFields: string[] = [];
+
+	for (const ex of exchanges) {
+		if (ex.request.method !== "POST") continue;
+		const contentType = ex.request.headers["content-type"];
+		const fields = getFormFields(ex.request.postData, contentType);
+
+		const hasPhoneField = fields.some((f) => PHONE_FIELD_NAMES.has(f.toLowerCase()));
+		const hasOtpField = fields.some((f) => OTP_FIELD_NAMES.has(f.toLowerCase()));
+
+		if (hasPhoneField && !hasOtpField) {
+			phoneEndpoint = ex.request.url;
+			phoneFields = fields;
+		}
+		if (hasOtpField) {
+			verifyEndpoint = ex.request.url;
+			codeFields = fields;
+		}
+	}
+
+	if (!phoneEndpoint && !verifyEndpoint) return null;
+
+	let confidence = 40;
+	if (phoneEndpoint && verifyEndpoint) confidence = 90;
+	else if (verifyEndpoint) confidence = 70;
+	else if (phoneEndpoint) confidence = 50;
+
+	// Check if a token appeared after the OTP verification
+	let tokenUsage: string = "unknown";
+	if (verifyEndpoint) {
+		const verifyTime = exchanges.find((e) => e.request.url === verifyEndpoint)?.request.timestamp ?? 0;
+		for (const later of exchanges) {
+			if (later.request.timestamp <= verifyTime) continue;
+			const auth = later.request.headers["authorization"] ?? "";
+			if (auth.startsWith("Bearer ")) {
+				tokenUsage = "bearer-header";
+				if (confidence < 90) confidence = 85;
+				break;
+			}
+		}
+	}
+
+	return {
+		mechanism: "jwt-form-login",
+		confidence,
+		details: {
+			mechanism: "jwt-form-login",
+			loginUrl: phoneEndpoint,
+			tokenEndpoint: verifyEndpoint,
+			formFields: [...phoneFields, ...codeFields],
+			contentType: "application/json",
+			tokenPath: "unknown (SMS OTP flow — phone submit then code verify)",
+			tokenUsage: tokenUsage as "bearer-header" | "cookie" | "unknown",
+		} as AuthDetails,
+	};
+}
+
 // ─── Detector: API Key ──────────────────────────────────────────
 
-function detectApiKey(exchanges: CapturedExchange[]): AuthProfile | null {
-	const API_KEY_HEADERS = [
-		"x-api-key",
-		"api-key",
-		"apikey",
-		"x-auth-token",
-		"x-access-token",
-	];
+const API_KEY_HEADERS = [
+	"x-api-key",
+	"api-key",
+	"apikey",
+	"x-auth-token",
+	"x-access-token",
+];
 
+// Query params that commonly hold long values but aren't API keys
+const NON_KEY_PARAMS = new Set([
+	"q", "query", "search", "filter", "sort", "page", "offset", "limit",
+	"redirect_uri", "redirect", "callback", "return", "next", "state",
+	"nonce", "scope", "response_type", "code", "url", "path", "data",
+]);
+
+// API keys look like hex, base64, or alphanumeric strings
+const KEY_LIKE_RE = /^[a-zA-Z0-9_\-+/.=]+$/;
+
+function detectApiKey(exchanges: CapturedExchange[]): AuthProfile | null {
 	// Check for consistent API key header across multiple requests
 	const headerCounts = new Map<string, Map<string, number>>();
 	for (const ex of exchanges) {
 		for (const headerName of API_KEY_HEADERS) {
 			const value = ex.request.headers[headerName];
-			if (value) {
+			if (value && KEY_LIKE_RE.test(value)) {
 				let valueCounts = headerCounts.get(headerName);
 				if (!valueCounts) {
 					valueCounts = new Map();
@@ -548,13 +631,17 @@ function detectApiKey(exchanges: CapturedExchange[]): AuthProfile | null {
 		}
 	}
 
-	// Check for consistent query param with long value
+	// Check for consistent query param with long key-like value
 	const queryKeyCounts = new Map<string, Map<string, number>>();
 	for (const ex of exchanges) {
 		try {
 			const url = new URL(ex.request.url);
 			for (const [key, value] of url.searchParams) {
-				if (value.length >= 20) {
+				if (
+					value.length >= 20 &&
+					!NON_KEY_PARAMS.has(key.toLowerCase()) &&
+					KEY_LIKE_RE.test(value)
+				) {
 					let valueCounts = queryKeyCounts.get(key);
 					if (!valueCounts) {
 						valueCounts = new Map();
@@ -597,6 +684,7 @@ const detectors: Array<(exchanges: CapturedExchange[]) => AuthProfile | null> = 
 	detectAudkenni,
 	detectSaml,
 	detectOAuth2,
+	detectSmsOtp,
 	detectJwtFormLogin,
 	detectSessionCookie,
 	detectBasicAuth,
