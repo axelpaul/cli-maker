@@ -21,22 +21,24 @@ npx playwright install chromium
 
 ### `sniff` — Capture API calls
 
-Opens a browser, intercepts all XHR/fetch traffic while you browse, then outputs a deduplicated API spec.
+Opens a browser, intercepts all XHR/fetch traffic while you browse, runs auth detection on the captured exchanges, and outputs a single deduplicated API spec that includes the auth profile.
 
 ```bash
-cli-maker sniff --url https://example.com
+cli-maker sniff --url https://example.com --capture-bodies --output spec.json
 ```
 
-Browse the site, perform the actions you want to capture, then press **Enter** (or close the browser) to stop.
+Browse the site, perform the actions you want to capture (including log in if applicable), then press **Enter** (or Ctrl+C, or close the browser) to stop.
 
 | Flag | Description |
 |---|---|
 | `--url` | Target URL (required) |
-| `--capture-bodies` | Include response bodies in the spec |
+| `--capture-bodies` | Include response bodies in the spec (recommended) |
 | `--allow-domain` | Only capture from these domains (repeatable) |
 | `--block-domain` | Block additional domains (repeatable) |
 | `--output <file>` | Write spec to file instead of stdout |
 | `--headless` | Run browser without a window |
+
+Response bodies are captured on the `requestfinished` event, so soft-navigation responses (e.g. Next.js `/_next/data/.../*.json` route data) end up in the spec rather than getting dropped.
 
 ### `auth-profile` — Detect authentication mechanism
 
@@ -52,14 +54,17 @@ Detects:
 
 - **JWT form login** — POST credentials, JWT in response, Bearer header
 - **AWS Cognito** — SRP protocol via cognito-idp endpoints
-- **Audkenni / island.is** — Icelandic national eID redirects
-- **OAuth2 / OIDC** — Authorization code and implicit flows
+- **Audkenni / island.is** — Icelandic national eID, two flavors:
+  - `flow: "redirect"` — classic browser redirect to `audkenni.is` / `innskraning.island.is` and back
+  - `flow: "bff-proxied"` — site exposes its own `/api/auth/start` + `/api/auth/poll` BFF that proxies to Audkenni server-side (no IdP redirect visible). Recognized by `authType ∈ {Sim, App, Card}` + `phoneNumber`/`ssn` in the start request and `authRequestId` in the poll.
+- **OAuth2 / OIDC** — Authorization code and implicit flows (Keycloak, Entra, Auth0, Okta, etc.)
 - **SAML** — SAMLRequest/SAMLResponse redirect chains
-- **Session cookies** — Set-Cookie after credential POST
+- **SMS / OTP** — Phone-number request followed by code-verify, JWT/session on completion
+- **Session cookies** — Set-Cookie after credential POST, reused on subsequent requests
 - **Basic auth** — WWW-Authenticate headers
 - **API keys** — Consistent key headers or query params
 
-Each detection includes a confidence score and typed details (endpoints, fields, token paths).
+Each detection includes a confidence score and typed details (endpoints, fields, token paths, cookie name, etc.). The same detector runs automatically inside `sniff`, so most users won't need `auth-profile` separately — it's there for cases where you only want the auth analysis without the full traffic spec.
 
 ### `scan-js` — Extract API paths from JS bundles
 
@@ -126,6 +131,22 @@ cli-maker help | jq '.commands[].name'
 ```
 
 The output spec contains everything needed to generate a typed API client: endpoint signatures, auth flow details, request/response shapes, and concrete examples.
+
+## Dedup behavior
+
+The endpoint deduplicator collapses URLs that share a structure into single templated entries with extracted path parameters:
+
+- Numeric IDs: `/api/users/123`, `/api/users/456` → `/api/users/:userId`
+- UUIDs, MongoIDs: same idea
+- File extensions: `/.../pantanir/62331.json`, `/.../pantanir/58224.json` → `/.../pantanir/:pantanirId.json` (extension preserved in the pattern)
+- Slugs: `/verslun/happy-cat`, `/verslun/animonda` → `/verslun/:verslunSlug` when the same prefix has 3+ distinct values
+- Query params are deduplicated separately with required/optional inference
+
+Parameter names get a `Slug` suffix when values aren't numeric/UUID-shaped, so generated CLIs come out with `:productSlug` rather than `:productId` where appropriate.
+
+## Example: gaeludyr.is → gaeludyr-cli
+
+A working end-to-end demo: cli-maker was used to reverse-engineer [gaeludyr.is](https://www.gaeludyr.is), and the resulting spec was fed into the `cli-creator` skill to produce [gaeludyr-cli](https://github.com/axelpaul/gaeludyr-cli) — a working CLI that authenticates via Audkenni Sim (BFF-proxied), searches the catalog via Typesense, manages a cart, lists orders, and computes shipping.
 
 ## Development
 

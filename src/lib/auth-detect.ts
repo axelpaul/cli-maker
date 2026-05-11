@@ -1,4 +1,4 @@
-import type { AuthDetails, AuthProfile, CapturedExchange } from "./types.ts";
+import type { AudkenniDetails, AuthDetails, AuthProfile, CapturedExchange } from "./types.ts";
 
 const JWT_RE = /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/;
 
@@ -46,6 +46,41 @@ function getFormFields(body: string | null, contentType: string | undefined): st
 		return [...new URLSearchParams(body).keys()];
 	}
 	return [];
+}
+
+/** Recursively collect all field names from a nested object */
+function collectDeepFieldNames(obj: unknown, fields: string[] = []): string[] {
+	if (obj && typeof obj === "object" && !Array.isArray(obj)) {
+		for (const [key, value] of Object.entries(obj as Record<string, unknown>)) {
+			fields.push(key);
+			collectDeepFieldNames(value, fields);
+		}
+	} else if (Array.isArray(obj)) {
+		for (const item of obj) collectDeepFieldNames(item, fields);
+	}
+	return fields;
+}
+
+/** For GraphQL requests, extract deep field names from variables + the query text */
+function getGraphQLFields(body: string | null, contentType: string | undefined): {
+	deepFields: string[];
+	queryText: string;
+	operationName: string;
+} {
+	const empty = { deepFields: [], queryText: "", operationName: "" };
+	if (!body || !contentType?.includes("application/json")) return empty;
+	try {
+		const parsed = JSON.parse(body) as Record<string, unknown>;
+		if (typeof parsed.query !== "string") return empty;
+		const deepFields = collectDeepFieldNames(parsed.variables);
+		return {
+			deepFields,
+			queryText: parsed.query as string,
+			operationName: (typeof parsed.operationName === "string" ? parsed.operationName : ""),
+		};
+	} catch {
+		return empty;
+	}
 }
 
 // ─── Detector: AWS Cognito ──────────────────────────────────────
@@ -96,6 +131,99 @@ function detectCognito(exchanges: CapturedExchange[]): AuthProfile | null {
 
 // ─── Detector: Audkenni / island.is ─────────────────────────────
 
+const AUDKENNI_AUTH_TYPES = new Set(["sim", "app", "card", "audkennisapp"]);
+
+// Cookies to ignore when guessing the session cookie name (trackers, etc.)
+const COOKIE_IGNORE_RE = /^(_ga|_gid|_gat|_fbp|_hj|_pk|amp_|ajs_|optimizely|hubspot|mp_|intercom)/i;
+
+interface BffSignals {
+	startEndpoint: string | null;
+	pollEndpoint: string | null;
+	authTypes: string[];
+	startBodyFields: string[];
+	sessionCookieName: string | null;
+}
+
+function detectAudkenniBff(exchanges: CapturedExchange[]): BffSignals | null {
+	let startEndpoint: string | null = null;
+	let pollEndpoint: string | null = null;
+	const authTypes = new Set<string>();
+	const startBodyFields = new Set<string>();
+	let sessionCookieName: string | null = null;
+	let lastFlowTimestamp = 0;
+
+	for (const ex of exchanges) {
+		if (ex.request.method !== "POST") continue;
+		const ct = ex.request.headers["content-type"];
+		if (!ct?.includes("application/json")) continue;
+		if (!ex.request.postData) continue;
+
+		let body: Record<string, unknown>;
+		try {
+			body = JSON.parse(ex.request.postData) as Record<string, unknown>;
+		} catch {
+			continue;
+		}
+
+		const authTypeValue = typeof body.authType === "string" ? body.authType.toLowerCase() : null;
+		const hasAuthType = authTypeValue !== null && AUDKENNI_AUTH_TYPES.has(authTypeValue);
+		const hasPhoneOrSsn = "phoneNumber" in body || "ssn" in body || "kennitala" in body;
+		const hasAuthRequestId = "authRequestId" in body;
+
+		if (hasAuthType && hasPhoneOrSsn) {
+			startEndpoint = ex.request.url;
+			authTypes.add(body.authType as string);
+			for (const f of Object.keys(body)) startBodyFields.add(f);
+			lastFlowTimestamp = Math.max(lastFlowTimestamp, ex.request.timestamp);
+		}
+
+		if (hasAuthRequestId) {
+			pollEndpoint = ex.request.url;
+			lastFlowTimestamp = Math.max(lastFlowTimestamp, ex.request.timestamp);
+		}
+	}
+
+	if (!startEndpoint && !pollEndpoint) return null;
+
+	// Look for the session cookie set during or just after the flow
+	for (const ex of exchanges) {
+		const setCookie = ex.response?.headers["set-cookie"];
+		if (!setCookie) continue;
+		if (ex.request.url === startEndpoint || ex.request.url === pollEndpoint) {
+			const m = setCookie.match(/^([^=]+)=/);
+			if (m && !COOKIE_IGNORE_RE.test(m[1]!)) {
+				sessionCookieName = m[1]!;
+				break;
+			}
+		}
+	}
+
+	// Fallback: pick the first non-tracker cookie present on a request after the flow
+	if (!sessionCookieName && lastFlowTimestamp > 0) {
+		for (const ex of exchanges) {
+			if (ex.request.timestamp <= lastFlowTimestamp) continue;
+			const cookieHeader = ex.request.headers["cookie"];
+			if (!cookieHeader) continue;
+			for (const pair of cookieHeader.split(/;\s*/)) {
+				const name = pair.split("=")[0]?.trim();
+				if (name && !COOKIE_IGNORE_RE.test(name)) {
+					sessionCookieName = name;
+					break;
+				}
+			}
+			if (sessionCookieName) break;
+		}
+	}
+
+	return {
+		startEndpoint,
+		pollEndpoint,
+		authTypes: [...authTypes],
+		startBodyFields: [...startBodyFields],
+		sessionCookieName,
+	};
+}
+
 function detectAudkenni(exchanges: CapturedExchange[]): AuthProfile | null {
 	const audkenniDomains = ["audkenni.is", "island.is", "innskraning.island.is"];
 	const redirectChain: string[] = [];
@@ -135,19 +263,41 @@ function detectAudkenni(exchanges: CapturedExchange[]): AuthProfile | null {
 		}
 	}
 
-	if (!idpUrl) return null;
+	const bff = detectAudkenniBff(exchanges);
+
+	if (!idpUrl && !bff) return null;
+
+	const flow: "redirect" | "bff-proxied" = idpUrl ? "redirect" : "bff-proxied";
+
+	let confidence: number;
+	if (idpUrl && callbackUrl) confidence = 90;
+	else if (idpUrl) confidence = 60;
+	else if (bff?.startEndpoint && bff.pollEndpoint) confidence = 85;
+	else if (bff?.startEndpoint || bff?.pollEndpoint) confidence = 65;
+	else confidence = 50;
+
+	const details: AudkenniDetails = {
+		mechanism: "audkenni-island-is",
+		flow,
+		loginUrl: idpUrl ?? bff?.startEndpoint ?? null,
+		tokenEndpoint: null,
+		idpUrl,
+		callbackUrl,
+		redirectChain,
+	};
+
+	if (bff) {
+		if (bff.startEndpoint) details.startEndpoint = bff.startEndpoint;
+		if (bff.pollEndpoint) details.pollEndpoint = bff.pollEndpoint;
+		if (bff.authTypes.length > 0) details.authTypes = bff.authTypes;
+		if (bff.startBodyFields.length > 0) details.startBodyFields = bff.startBodyFields;
+		if (bff.sessionCookieName) details.sessionCookieName = bff.sessionCookieName;
+	}
 
 	return {
 		mechanism: "audkenni-island-is",
-		confidence: callbackUrl ? 90 : 60,
-		details: {
-			mechanism: "audkenni-island-is",
-			loginUrl: idpUrl,
-			tokenEndpoint: null,
-			idpUrl,
-			callbackUrl,
-			redirectChain,
-		},
+		confidence,
+		details,
 	};
 }
 
@@ -504,15 +654,65 @@ function detectBasicAuth(exchanges: CapturedExchange[]): AuthProfile | null {
 
 // ─── Detector: SMS / OTP ────────────────────────────────────────
 
-const OTP_FIELD_NAMES = new Set([
-	"code", "otp", "token", "pin", "verification_code", "verificationcode",
-	"sms_code", "smscode", "one_time_code", "otpcode",
+// Broad keywords indicating this is an OTP-related flow
+const OTP_FLOW_KEYWORDS = [
+	"otp", "onetime", "onetimepassword", "one_time_password",
+	"sms_code", "smscode", "one_time",
+];
+
+// Exact field names that indicate the verify/code-submit step (NOT substring-matched)
+const VERIFY_EXACT_FIELDS = new Set([
+	"code", "otp", "pin", "passcode", "otpcode", "sms_code", "smscode",
+	"verificationcode", "verification_code", "one_time_code",
 ]);
 
-const PHONE_FIELD_NAMES = new Set([
-	"phone", "phone_number", "phonenumber", "mobile", "tel", "telephone",
-	"msisdn", "sms", "cellphone",
-]);
+const PHONE_FIELD_KEYWORDS = [
+	"phone", "mobile", "tel", "telephone", "msisdn", "cellphone",
+	"identifier",
+];
+
+// URL path segments that suggest SMS/OTP flow
+const PHONE_PATH_RE = /\/(send[-_]?sms|send[-_]?otp|send[-_]?code|phone[-_]?login|request[-_]?otp|sms[-_]?auth|phone[-_]?auth|login[-_]?phone|send[-_]?verification)/i;
+const VERIFY_PATH_RE = /\/(verify[-_]?(sms|otp|code|phone)?|confirm[-_]?(sms|otp|code|phone)?|validate[-_]?(sms|otp|code|phone)?|check[-_]?(sms|otp|code|phone)?|sms[-_]?verify|otp[-_]?verify|code[-_]?verify)/i;
+
+// Broad OTP signal in GraphQL query/operation text
+const OTP_QUERY_TEXT_RE = /onetimepassword|one.?time.?password|otp|sms.?code|verification.?code|phone.?verification/i;
+
+// Phone number value pattern (international format)
+const PHONE_VALUE_RE = /^\+\d{7,15}$/;
+
+function fieldMatchesAny(field: string, keywords: string[]): boolean {
+	const lower = field.toLowerCase();
+	if (keywords.includes(lower)) return true;
+	return keywords.some((kw) => lower.includes(kw));
+}
+
+/** Check if any nested variable value looks like a phone number */
+function hasPhoneValue(obj: unknown): boolean {
+	if (typeof obj === "string") return PHONE_VALUE_RE.test(obj);
+	if (obj && typeof obj === "object") {
+		for (const v of Object.values(obj as Record<string, unknown>)) {
+			if (hasPhoneValue(v)) return true;
+		}
+	}
+	return false;
+}
+
+/** Check if any deep field name exactly matches a verify-step field */
+function hasVerifyField(fields: string[]): boolean {
+	return fields.some((f) => VERIFY_EXACT_FIELDS.has(f.toLowerCase()));
+}
+
+/** Check if the request is part of an OTP flow (broad signal) */
+function isOtpFlowRequest(fields: string[], gql: { deepFields: string[]; queryText: string; operationName: string }): boolean {
+	// Check form fields
+	if (fields.some((f) => fieldMatchesAny(f, OTP_FLOW_KEYWORDS))) return true;
+	// Check deep GraphQL field names
+	if (gql.deepFields.some((f) => fieldMatchesAny(f, OTP_FLOW_KEYWORDS))) return true;
+	// Check query text / operation name
+	if (OTP_QUERY_TEXT_RE.test(gql.queryText) || OTP_QUERY_TEXT_RE.test(gql.operationName)) return true;
+	return false;
+}
 
 function detectSmsOtp(exchanges: CapturedExchange[]): AuthProfile | null {
 	let phoneEndpoint: string | null = null;
@@ -524,17 +724,43 @@ function detectSmsOtp(exchanges: CapturedExchange[]): AuthProfile | null {
 		if (ex.request.method !== "POST") continue;
 		const contentType = ex.request.headers["content-type"];
 		const fields = getFormFields(ex.request.postData, contentType);
+		const url = ex.request.url;
+		let pathname = "";
+		try { pathname = new URL(url).pathname; } catch { /* ignore */ }
 
-		const hasPhoneField = fields.some((f) => PHONE_FIELD_NAMES.has(f.toLowerCase()));
-		const hasOtpField = fields.some((f) => OTP_FIELD_NAMES.has(f.toLowerCase()));
+		const gql = getGraphQLFields(ex.request.postData, contentType);
+		const allFields = gql.queryText ? gql.deepFields : fields;
 
-		if (hasPhoneField && !hasOtpField) {
-			phoneEndpoint = ex.request.url;
-			phoneFields = fields;
+		// Is this request part of an OTP flow at all?
+		const otpFlow = isOtpFlowRequest(fields, gql);
+
+		// Is this the verify/code-submit step? (exact field name match)
+		const isVerifyStep = hasVerifyField(allFields);
+
+		// Does this request contain a phone number?
+		const hasPhone = allFields.some((f) => fieldMatchesAny(f, PHONE_FIELD_KEYWORDS))
+			|| (gql.queryText ? (() => {
+				try {
+					const parsed = JSON.parse(ex.request.postData!) as Record<string, unknown>;
+					return hasPhoneValue(parsed.variables);
+				} catch { return false; }
+			})() : false);
+
+		// Does the response contain a JWT? (verify step should yield a token)
+		const responseHasJwt = ex.response?.body ? JWT_RE.test(ex.response.body) : false;
+
+		const phonePathMatch = PHONE_PATH_RE.test(pathname);
+		const verifyPathMatch = VERIFY_PATH_RE.test(pathname);
+
+		// Classify: verify step = has a "code" field, or response has JWT + is OTP flow, or URL path matches
+		if (isVerifyStep || (otpFlow && responseHasJwt) || (verifyPathMatch && allFields.length > 0)) {
+			verifyEndpoint = url;
+			codeFields = allFields;
 		}
-		if (hasOtpField) {
-			verifyEndpoint = ex.request.url;
-			codeFields = fields;
+		// Phone step = has phone signal in an OTP flow, without being the verify step
+		else if ((otpFlow && hasPhone) || (phonePathMatch && !verifyPathMatch)) {
+			phoneEndpoint = url;
+			phoneFields = allFields;
 		}
 	}
 
@@ -545,9 +771,16 @@ function detectSmsOtp(exchanges: CapturedExchange[]): AuthProfile | null {
 	else if (verifyEndpoint) confidence = 70;
 	else if (phoneEndpoint) confidence = 50;
 
-	// Check if a token appeared after the OTP verification
-	let tokenUsage: string = "unknown";
+	// Check if a JWT appeared in the verify response or subsequent requests
+	let tokenUsage: "bearer-header" | "cookie" | "unknown" = "unknown";
 	if (verifyEndpoint) {
+		const verifyEx = exchanges.find((e) => e.request.url === verifyEndpoint && e.response?.body && JWT_RE.test(e.response.body));
+		if (verifyEx) {
+			tokenUsage = "bearer-header";
+			if (confidence < 90) confidence = 85;
+		}
+	}
+	if (tokenUsage === "unknown" && verifyEndpoint) {
 		const verifyTime = exchanges.find((e) => e.request.url === verifyEndpoint)?.request.timestamp ?? 0;
 		for (const later of exchanges) {
 			if (later.request.timestamp <= verifyTime) continue;
@@ -561,17 +794,18 @@ function detectSmsOtp(exchanges: CapturedExchange[]): AuthProfile | null {
 	}
 
 	return {
-		mechanism: "jwt-form-login",
+		mechanism: "sms-otp",
 		confidence,
 		details: {
-			mechanism: "jwt-form-login",
+			mechanism: "sms-otp",
 			loginUrl: phoneEndpoint,
 			tokenEndpoint: verifyEndpoint,
-			formFields: [...phoneFields, ...codeFields],
-			contentType: "application/json",
-			tokenPath: "unknown (SMS OTP flow — phone submit then code verify)",
-			tokenUsage: tokenUsage as "bearer-header" | "cookie" | "unknown",
-		} as AuthDetails,
+			phoneEndpoint,
+			verifyEndpoint,
+			phoneFields,
+			codeFields,
+			tokenUsage,
+		},
 	};
 }
 
@@ -585,12 +819,8 @@ const API_KEY_HEADERS = [
 	"x-access-token",
 ];
 
-// Query params that commonly hold long values but aren't API keys
-const NON_KEY_PARAMS = new Set([
-	"q", "query", "search", "filter", "sort", "page", "offset", "limit",
-	"redirect_uri", "redirect", "callback", "return", "next", "state",
-	"nonce", "scope", "response_type", "code", "url", "path", "data",
-]);
+// For query params: only consider params whose name suggests an API key
+const API_KEY_PARAM_NAME_RE = /key|token|auth|secret|credential|access|apikey/i;
 
 // API keys look like hex, base64, or alphanumeric strings
 const KEY_LIKE_RE = /^[a-zA-Z0-9_\-+/.=]+$/;
@@ -632,6 +862,7 @@ function detectApiKey(exchanges: CapturedExchange[]): AuthProfile | null {
 	}
 
 	// Check for consistent query param with long key-like value
+	// Only consider params whose name suggests an API key to avoid tracking param false positives
 	const queryKeyCounts = new Map<string, Map<string, number>>();
 	for (const ex of exchanges) {
 		try {
@@ -639,7 +870,7 @@ function detectApiKey(exchanges: CapturedExchange[]): AuthProfile | null {
 			for (const [key, value] of url.searchParams) {
 				if (
 					value.length >= 20 &&
-					!NON_KEY_PARAMS.has(key.toLowerCase()) &&
+					API_KEY_PARAM_NAME_RE.test(key) &&
 					KEY_LIKE_RE.test(value)
 				) {
 					let valueCounts = queryKeyCounts.get(key);

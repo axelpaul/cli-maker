@@ -1,8 +1,23 @@
-import type { Page, Request, Response } from "playwright";
+import type { Page, Request } from "playwright";
 import { isNoise, type NoiseFilterOptions } from "./noise-filter.ts";
 import type { CapturedExchange, CapturedRequest, CapturedResponse } from "./types.ts";
 
 const MAX_BODY_SIZE = 1_048_576; // 1MB
+const BODY_READ_TIMEOUT_MS = 5_000;
+
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+	let t: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			p,
+			new Promise<T>((_, reject) => {
+				t = setTimeout(() => reject(new Error("timeout")), ms);
+			}),
+		]);
+	} finally {
+		if (t) clearTimeout(t);
+	}
+}
 
 export interface InterceptorOptions {
 	captureBodies?: boolean;
@@ -10,14 +25,16 @@ export interface InterceptorOptions {
 }
 
 export interface InterceptorHandle {
+	attachToPage(page: Page): void;
 	getExchanges(): CapturedExchange[];
 	getFilteredCount(): number;
 	stop(): void;
 }
 
-export function attachInterceptor(page: Page, opts: InterceptorOptions): InterceptorHandle {
+export function attachInterceptor(initialPage: Page, opts: InterceptorOptions): InterceptorHandle {
 	const exchanges: CapturedExchange[] = [];
 	const pending = new Map<Request, { captured: CapturedRequest; startTime: number }>();
+	const attachedPages = new Set<Page>();
 	let filteredCount = 0;
 	let stopped = false;
 
@@ -49,54 +66,91 @@ export function attachInterceptor(page: Page, opts: InterceptorOptions): Interce
 		pending.set(request, { captured, startTime: Date.now() });
 	}
 
-	async function onResponse(response: Response): Promise<void> {
+	async function onRequestFinished(request: Request): Promise<void> {
 		if (stopped) return;
 
-		const request = response.request();
 		const entry = pending.get(request);
 		if (!entry) return;
 		pending.delete(request);
 
-		const headers: Record<string, string> = {};
-		for (const [k, v] of Object.entries(await response.allHeaders())) {
-			headers[k] = v;
-		}
+		try {
+			const response = await request.response();
+			if (!response) {
+				exchanges.push({
+					request: entry.captured,
+					response: null,
+					duration: Date.now() - entry.startTime,
+				});
+				return;
+			}
 
-		let body: string | null = null;
-		let bodySize = 0;
-
-		if (opts.captureBodies) {
+			const headers: Record<string, string> = {};
 			try {
-				const buffer = await response.body();
-				bodySize = buffer.length;
-				if (bodySize <= MAX_BODY_SIZE) {
-					body = buffer.toString("utf-8");
+				for (const [k, v] of Object.entries(await response.allHeaders())) {
+					headers[k] = v;
 				}
 			} catch {
-				// Response body unavailable (e.g. redirects, streaming)
+				// Headers no longer available; continue with empty set
 			}
+
+			let body: string | null = null;
+			let bodySize = 0;
+
+			if (opts.captureBodies) {
+				try {
+					const buffer = await withTimeout(response.body(), BODY_READ_TIMEOUT_MS);
+					bodySize = buffer.length;
+					if (bodySize <= MAX_BODY_SIZE) {
+						body = buffer.toString("utf-8");
+					}
+				} catch {
+					// Body not available, timed out, or page navigated away mid-read
+				}
+			}
+
+			const captured: CapturedResponse = {
+				status: response.status(),
+				statusText: response.statusText(),
+				headers,
+				body,
+				bodySize,
+				mimeType: headers["content-type"] ?? "",
+			};
+
+			exchanges.push({
+				request: entry.captured,
+				response: captured,
+				duration: Date.now() - entry.startTime,
+			});
+		} catch {
+			// Request invalidated (page navigated, context closed). Drop silently.
 		}
+	}
 
-		const captured: CapturedResponse = {
-			status: response.status(),
-			statusText: response.statusText(),
-			headers,
-			body,
-			bodySize,
-			mimeType: headers["content-type"] ?? "",
-		};
-
+	function onRequestFailed(request: Request): void {
+		if (stopped) return;
+		const entry = pending.get(request);
+		if (!entry) return;
+		pending.delete(request);
 		exchanges.push({
 			request: entry.captured,
-			response: captured,
+			response: null,
 			duration: Date.now() - entry.startTime,
 		});
 	}
 
-	page.on("request", onRequest);
-	page.on("response", (r) => void onResponse(r));
+	function attachToPage(page: Page): void {
+		if (stopped || attachedPages.has(page)) return;
+		attachedPages.add(page);
+		page.on("request", onRequest);
+		page.on("requestfinished", (r) => void onRequestFinished(r));
+		page.on("requestfailed", onRequestFailed);
+	}
+
+	attachToPage(initialPage);
 
 	return {
+		attachToPage,
 		getExchanges() {
 			return exchanges;
 		},
@@ -105,7 +159,9 @@ export function attachInterceptor(page: Page, opts: InterceptorOptions): Interce
 		},
 		stop() {
 			stopped = true;
-			page.removeListener("request", onRequest);
+			for (const page of attachedPages) {
+				page.removeListener("request", onRequest);
+			}
 		},
 	};
 }

@@ -9,20 +9,42 @@ import type {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MONGO_ID_RE = /^[0-9a-f]{24}$/i;
 const NUMERIC_RE = /^\d+$/;
+const EXT_RE = /\.(json|html?|xml|txt)$/i;
+
+/** Split a segment into (stem, extension). Extension includes the leading dot. */
+function splitExt(segment: string): { stem: string; ext: string } {
+	const m = segment.match(EXT_RE);
+	if (!m) return { stem: segment, ext: "" };
+	return { stem: segment.slice(0, -m[0].length), ext: m[0] };
+}
 
 function isLikelyId(segment: string): boolean {
-	if (NUMERIC_RE.test(segment)) return true;
-	if (UUID_RE.test(segment)) return true;
-	if (MONGO_ID_RE.test(segment)) return true;
+	const { stem } = splitExt(segment);
+	if (NUMERIC_RE.test(stem)) return true;
+	if (UUID_RE.test(stem)) return true;
+	if (MONGO_ID_RE.test(stem)) return true;
 	return false;
 }
 
-function inferParamName(segments: string[], paramIndex: number): string {
+/** Slug-shaped: lowercase alphanumerics with hyphens, or long enough to be unlikely as an endpoint name. */
+function isLikelySlug(segment: string): boolean {
+	const { stem } = splitExt(segment);
+	if (!/^[a-z0-9][a-z0-9._-]*$/.test(stem)) return false;
+	if (stem.includes("-")) return true;
+	if (stem.length >= 16) return true;
+	return false;
+}
+
+function inferParamName(segments: string[], paramIndex: number, examples: string[]): string {
 	const prev = segments[paramIndex - 1];
+	const allNumericOrUuid = examples.every((e) => {
+		const { stem } = splitExt(e);
+		return NUMERIC_RE.test(stem) || UUID_RE.test(stem) || MONGO_ID_RE.test(stem);
+	});
+	const suffix = allNumericOrUuid ? "Id" : "Slug";
 	if (prev) {
-		// "/users/123" → :userId, "/items/abc" → :itemId
 		const singular = prev.endsWith("s") ? prev.slice(0, -1) : prev;
-		return `${singular}Id`;
+		return `${singular}${suffix}`;
 	}
 	return `param${paramIndex}`;
 }
@@ -159,13 +181,15 @@ export function deduplicateEndpoints(exchanges: CapturedExchange[]): ApiEndpoint
 		const dynamicPositions = new Set<number>();
 
 		for (let i = 0; i < segCount; i++) {
-			const values = new Set(group.map((g) => g.parsed.segments[i]));
-			if (values.size > 1) {
-				// Multiple distinct values at this position — check if they look like IDs
-				const allIds = [...values].every((v) => v !== undefined && isLikelyId(v));
-				if (allIds) {
-					dynamicPositions.add(i);
-				}
+			const valuesArr = group.map((g) => g.parsed.segments[i]).filter((v): v is string => v != null);
+			const values = [...new Set(valuesArr)];
+			if (values.length <= 1) continue;
+			const allIds = values.every(isLikelyId);
+			const allSlugs = values.every(isLikelySlug);
+			const allIdOrSlug = values.every((v) => isLikelyId(v) || isLikelySlug(v));
+			const manyDistinct = values.length >= 3;
+			if (allIds || allSlugs || allIdOrSlug || manyDistinct) {
+				dynamicPositions.add(i);
 			}
 		}
 
@@ -173,7 +197,9 @@ export function deduplicateEndpoints(exchanges: CapturedExchange[]): ApiEndpoint
 		for (const item of group) {
 			const patternSegments = item.parsed.segments.map((seg, i) => {
 				if (dynamicPositions.has(i)) {
-					return `:${inferParamName(item.parsed.segments, i)}`;
+					const examples = [...new Set(group.map((g) => g.parsed.segments[i]!))];
+					const { ext } = splitExt(seg);
+					return `:${inferParamName(item.parsed.segments, i, examples)}${ext}`;
 				}
 				return seg;
 			});
@@ -201,14 +227,21 @@ export function deduplicateEndpoints(exchanges: CapturedExchange[]): ApiEndpoint
 		const dynamicPositions = new Map<number, string[]>();
 		for (let i = 0; i < segCount; i++) {
 			const values = [...new Set(group.map((g) => g.parsed.segments[i]!))];
-			if (values.length > 1 && values.every(isLikelyId)) {
+			if (values.length <= 1) continue;
+			const allIds = values.every(isLikelyId);
+			const allSlugs = values.every(isLikelySlug);
+			const allIdOrSlug = values.every((v) => isLikelyId(v) || isLikelySlug(v));
+			const manyDistinct = values.length >= 3;
+			if (allIds || allSlugs || allIdOrSlug || manyDistinct) {
 				dynamicPositions.set(i, values);
 			}
 		}
 
 		const patternSegments = first.parsed.segments.map((seg, i) => {
 			if (dynamicPositions.has(i)) {
-				return `:${inferParamName(first.parsed.segments, i)}`;
+				const examples = dynamicPositions.get(i)!;
+				const { ext } = splitExt(seg);
+				return `:${inferParamName(first.parsed.segments, i, examples)}${ext}`;
 			}
 			return seg;
 		});
@@ -219,7 +252,7 @@ export function deduplicateEndpoints(exchanges: CapturedExchange[]): ApiEndpoint
 		for (const [pos, examples] of dynamicPositions) {
 			pathParams.push({
 				position: pos,
-				name: inferParamName(first.parsed.segments, pos),
+				name: inferParamName(first.parsed.segments, pos, examples),
 				examples: examples.slice(0, 5),
 			});
 		}

@@ -4,3 +4,19 @@ dist/
 bun.lock
 cli-maker
 *.tsbuildinfo
+
+# Local tooling / agent configs (never commit)
+CLAUDE.md
+.claude/
+.mcp.json
+apm.yml
+apm.lock.yaml
+apm_modules/
+
+# Captured specs / auth profiles often contain personal data — keep local
+auth.json
+gaeludyr_*.json
+*_spec.json
+*_bodies.json
+*_full.json
+*_auth.json

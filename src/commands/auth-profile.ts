@@ -8,6 +8,7 @@ export interface AuthProfileOptions {
 	url: string;
 	outputFile: string | null;
 	headless: boolean;
+	dumpTraffic: string | null;
 }
 
 export async function authProfile(opts: AuthProfileOptions): Promise<void> {
@@ -60,6 +61,21 @@ export async function authProfile(opts: AuthProfileOptions): Promise<void> {
 
 	await closeBrowser(session);
 
+	if (opts.dumpTraffic) {
+		const dump = exchanges.map((ex) => ({
+			method: ex.request.method,
+			url: ex.request.url,
+			requestHeaders: ex.request.headers,
+			postData: ex.request.postData,
+			resourceType: ex.request.resourceType,
+			responseStatus: ex.response?.status,
+			responseHeaders: ex.response?.headers,
+			responseBody: ex.response?.body?.slice(0, 2000),
+		}));
+		writeFileSync(opts.dumpTraffic, JSON.stringify(dump, null, 2));
+		log(`\nTraffic dump (${exchanges.length} exchanges) written to ${opts.dumpTraffic}`);
+	}
+
 	const profile = profileAuth(exchanges);
 
 	log(`\nAuth Profile Detected:`);
@@ -73,6 +89,14 @@ export async function authProfile(opts: AuthProfileOptions): Promise<void> {
 	if (profile.mechanism === "jwt-form-login" && profile.details.mechanism === "jwt-form-login") {
 		log(`  Fields:     ${profile.details.formFields.join(", ")}`);
 		log(`  Token Path: ${profile.details.tokenPath}`);
+		log(`  Token Use:  ${profile.details.tokenUsage}`);
+	}
+
+	if (profile.mechanism === "sms-otp" && profile.details.mechanism === "sms-otp") {
+		if (profile.details.phoneEndpoint) log(`  Phone EP:   ${profile.details.phoneEndpoint}`);
+		if (profile.details.verifyEndpoint) log(`  Verify EP:  ${profile.details.verifyEndpoint}`);
+		if (profile.details.phoneFields.length) log(`  Phone Fields: ${profile.details.phoneFields.join(", ")}`);
+		if (profile.details.codeFields.length) log(`  Code Fields:  ${profile.details.codeFields.join(", ")}`);
 		log(`  Token Use:  ${profile.details.tokenUsage}`);
 	}
 

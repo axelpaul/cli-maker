@@ -112,6 +112,7 @@ try {
 				url: getFlag("--url") ?? "",
 				outputFile: getFlag("--output"),
 				headless: hasFlag("--headless"),
+				dumpTraffic: getFlag("--dump-traffic"),
 			});
 			break;
 

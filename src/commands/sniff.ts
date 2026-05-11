@@ -1,8 +1,9 @@
 import { writeFileSync } from "node:fs";
+import { profileAuth } from "../lib/auth-detect.ts";
 import { closeBrowser, launchBrowser, navigateTo } from "../lib/browser.ts";
 import { deduplicateEndpoints } from "../lib/dedup.ts";
 import { attachInterceptor } from "../lib/interceptor.ts";
-import { log, logInline, output, outputError } from "../lib/output.ts";
+import { log, output, outputError } from "../lib/output.ts";
 import type { ApiSpec } from "../lib/types.ts";
 
 export interface SniffOptions {
@@ -41,9 +42,8 @@ export async function sniff(opts: SniffOptions): Promise<void> {
 
 	log("Monitoring network traffic...");
 	log("Browse the site and perform the actions you want to capture.");
-	log("Press Enter when done (or close the browser).\n");
+	log("Press Enter (or Ctrl+C) when done.\n");
 
-	// Wait for Enter keypress or browser close
 	await new Promise<void>((resolve) => {
 		let resolved = false;
 		const done = () => {
@@ -52,14 +52,22 @@ export async function sniff(opts: SniffOptions): Promise<void> {
 			resolve();
 		};
 
-		// Enter key in terminal
 		process.stdin.setRawMode?.(false);
 		process.stdin.resume();
-		process.stdin.once("data", done);
-
-		// Browser closed by user
+		process.stdin.on("data", (chunk) => {
+			const s = chunk.toString();
+			if (s.includes("\n") || s.includes("\r")) done();
+		});
 		session.page.on("close", done);
 		session.context.on("close", done);
+		session.browser.on("disconnected", done);
+
+		let sigintCount = 0;
+		process.on("SIGINT", () => {
+			sigintCount++;
+			if (sigintCount === 1) done();
+			else process.exit(130);
+		});
 	});
 
 	log("Stopping capture...");
@@ -69,15 +77,8 @@ export async function sniff(opts: SniffOptions): Promise<void> {
 	const filteredCount = interceptor.getFilteredCount();
 	const sessionDuration = Date.now() - startTime;
 
-	await closeBrowser(session);
-
-	// Deduplicate
 	const endpoints = deduplicateEndpoints(exchanges);
-
-	log(`\nCaptured ${exchanges.length} requests, ${endpoints.length} unique API endpoints:`);
-	for (const ep of endpoints) {
-		log(`  ${ep.method.padEnd(6)} ${ep.pathPattern}`);
-	}
+	const auth = profileAuth(exchanges);
 
 	const spec: ApiSpec = {
 		version: "1",
@@ -85,7 +86,7 @@ export async function sniff(opts: SniffOptions): Promise<void> {
 		targetUrl: opts.url,
 		targetDomain: new URL(opts.url).hostname,
 		endpoints,
-		auth: null,
+		auth: auth.mechanism === "unknown" ? null : auth,
 		jsScanResults: null,
 		metadata: {
 			sessionDuration,
@@ -95,10 +96,22 @@ export async function sniff(opts: SniffOptions): Promise<void> {
 		},
 	};
 
+	// Write spec BEFORE closing browser, in case close hangs.
 	if (opts.outputFile) {
 		writeFileSync(opts.outputFile, JSON.stringify(spec, null, 2));
-		log(`\nSpec written to ${opts.outputFile}`);
+		log(`Spec written to ${opts.outputFile}`);
 	} else {
 		output(spec);
 	}
+
+	log(`\nCaptured ${exchanges.length} requests, ${endpoints.length} unique endpoints:`);
+	for (const ep of endpoints) {
+		log(`  ${ep.method.padEnd(6)} ${ep.pathPattern}`);
+	}
+	log(`Auth: ${auth.mechanism} (${auth.confidence}% confidence)`);
+
+	await Promise.race([
+		closeBrowser(session).catch(() => {}),
+		new Promise<void>((r) => setTimeout(r, 5000)),
+	]);
 }

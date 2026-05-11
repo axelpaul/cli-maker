@@ -67,6 +67,7 @@ export type AuthMechanism =
 	| "audkenni-island-is"
 	| "oauth2-oidc"
 	| "saml"
+	| "sms-otp"
 	| "session-cookie"
 	| "basic-auth"
 	| "api-key"
@@ -103,9 +104,16 @@ export interface AwsCognitoDetails extends AuthDetailsBase {
 
 export interface AudkenniDetails extends AuthDetailsBase {
 	mechanism: "audkenni-island-is";
-	idpUrl: string;
+	flow: "redirect" | "bff-proxied";
+	idpUrl: string | null;
 	callbackUrl: string | null;
 	redirectChain: string[];
+	// Present when flow === "bff-proxied"
+	startEndpoint?: string;
+	pollEndpoint?: string;
+	authTypes?: string[];
+	startBodyFields?: string[];
+	sessionCookieName?: string;
 }
 
 export interface OAuth2Details extends AuthDetailsBase {
@@ -139,6 +147,15 @@ export interface BasicAuthDetails extends AuthDetailsBase {
 	protectedPaths: string[];
 }
 
+export interface SmsOtpDetails extends AuthDetailsBase {
+	mechanism: "sms-otp";
+	phoneEndpoint: string | null;
+	verifyEndpoint: string | null;
+	phoneFields: string[];
+	codeFields: string[];
+	tokenUsage: "bearer-header" | "cookie" | "unknown";
+}
+
 export interface ApiKeyDetails extends AuthDetailsBase {
 	mechanism: "api-key";
 	keyLocation: "header" | "query";
@@ -152,6 +169,7 @@ export type AuthDetails =
 	| AudkenniDetails
 	| OAuth2Details
 	| SamlDetails
+	| SmsOtpDetails
 	| SessionCookieDetails
 	| BasicAuthDetails
 	| ApiKeyDetails
